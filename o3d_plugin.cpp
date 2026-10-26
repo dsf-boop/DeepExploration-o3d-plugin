@@ -8,6 +8,7 @@
 #include <string>
 #include <algorithm>
 #include <map>
+#include <set>
 
 #define _DEBUG_LOG 1
 
@@ -502,21 +503,22 @@ typedef void* P_e3_MATERIAL;
 
 // Unique GUID for O3D format in Deep Exploration
 static const GUID O3D_TYPE_GUID = { 0x19840e3d, 0x4f4d, 0x5349, { 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
+static const GUID O3D_CFG_TYPE_GUID = { 0x19840e3d, 0x4f4d, 0x5349, { 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02 } };
 
 // Format Registration structure expected by Deep Exploration (size 0x52 = 82 bytes)
 #pragma pack(push, 1)
 struct DE_FILETYPE_REG {
-    DWORD size;          // 0x00: 0x52 (82 bytes)
-    DWORD flags;         // 0x04: 0x23c01
-    const wchar_t* ext;  // 0x08: L"o3d"
-    const wchar_t* desc; // 0x0c: L"OMSI 2 3D Model (*.o3d)"
-    GUID  guid1;         // 0x10: 16 bytes
-    DWORD cookie;        // 0x20: cookie
-    const char* optName; // 0x24: NULL
-    void* callback;      // 0x28: callback
-    GUID  e3_type;       // 0x2c: Non-zero GUID
-    DWORD reserved[5];   // 0x3c: 20 bytes
-    WORD  reserved_end;  // 0x50: 2 bytes
+    DWORD size;           // 0x00: 0x52 (82 bytes)
+    DWORD flags;          // 0x04: 0x22c01 (No options flag)
+    const wchar_t* ext;   // 0x08: L"o3d"
+    const wchar_t* desc;  // 0x0c: L"OMSI 2 3D Model"
+    void* formatInfo[4];  // 0x10..0x1c: 4 pointers from getFormatInfo (or NULL)
+    HINSTANCE hInstance;  // 0x20: cookie / hInstance (g_hModule) -> CRITICAL! Checked at 0x1000160d!
+    const char* optName;  // 0x24: NULL (strdup'd at 0x100015c8)
+    void* callback;       // 0x28: O3D_Callback function pointer
+    GUID  guid1;          // 0x2c..0x3b: 16 bytes
+    GUID  guid2;          // 0x3c..0x4b: 16 bytes
+    BYTE  reserved[6];    // 0x4c..0x51: 6 bytes -> sizeof(DE_FILETYPE_REG) = 0x52 (82 bytes)
 };
 #pragma pack(pop)
 
@@ -884,84 +886,64 @@ static std::map<void*, std::vector<float>> s_originalMatrix;
 static std::vector<float> s_lastImportedMatrix;
 static bool s_hasLastImportedMatrix = false;
 
-static unsigned int DoImport(P_e3_STREAM stream, P_e3_SCENE scene) {
-    wchar_t filePath[MAX_PATH] = {0};
-    bool resW = Stream_GetFileNameW(stream, filePath, MAX_PATH);
-    PluginLog("Stream_GetFileNameW returned %d: '%ls'\n", (int)resW, filePath);
-
-    O3D_Model model;
-    bool loaded = false;
-    if (filePath[0] != L'\0') {
-        if (ReadO3DFile(filePath, model)) {
-            loaded = true;
-            PluginLog("DoImport: Loaded from file successfully, vertices=%u, faces=%u\n",
-                      (unsigned int)model.vertices.size(), (unsigned int)model.faces.size());
-        } else {
-            PluginLog("DoImport: ReadO3DFile failed for '%ls'\n", filePath);
-        }
-    }
-
-    if (!loaded) {
-        PluginLog("DoImport: Model not loaded, returning 0\n");
-        return 0;
-    }
-
-    // Extract node name from file name
-    char nodeName[MAX_PATH] = "O3D_Mesh";
-    const wchar_t* pSlash = wcsrchr(filePath, L'\\');
-    if (!pSlash) pSlash = wcsrchr(filePath, L'/');
-    if (pSlash) {
-        wchar_t wBase[MAX_PATH];
-        wcscpy(wBase, pSlash + 1);
-        wchar_t* pDot = wcsrchr(wBase, L'.');
-        if (pDot) *pDot = L'\0';
-        WideCharToMultiByte(CP_ACP, 0, wBase, -1, nodeName, MAX_PATH, NULL, NULL);
-    }
-
+static bool ImportMeshToScene(P_e3_SCENE scene, const O3D_Model& model, const char* nodeName,
+                             const wchar_t* modelDir, const wchar_t* baseDir, bool preservePivot,
+                             std::map<std::string, P_e3_MATERIAL>& matCache) {
     // Create child node with mesh in scene
     P_e3_NODE node = Scene_CreateMeshChild(scene, nodeName);
     if (!node) {
-        PluginLog("DoImport: Scene_CreateMeshChild failed\n");
-        return 0;
+        PluginLog("ImportMeshToScene: Scene_CreateMeshChild failed for '%s'\n", nodeName);
+        return false;
     }
 
     P_e3_MESH mesh = Node_GetMesh(node);
     if (!mesh) {
-        PluginLog("DoImport: Node_GetMesh failed\n");
-        return 0;
+        PluginLog("ImportMeshToScene: Node_GetMesh failed for '%s'\n", nodeName);
+        return false;
     }
 
     // 1. Create and configure materials in scene
     std::vector<P_e3_MATERIAL> deMaterials;
-    wchar_t modelDir[MAX_PATH] = {0};
-    wcscpy(modelDir, filePath);
-    wchar_t* pSep = wcsrchr(modelDir, L'\\');
-    if (!pSep) pSep = wcsrchr(modelDir, L'/');
-    if (pSep) *pSep = L'\0';
 
     if (model.materials.empty()) {
-        P_e3_MATERIAL mat = Scene_CreateMaterial(scene);
-        if (mat) {
-            Material_SetNameA(mat, "DefaultMaterial");
-            float defDiff[3] = { 0.8f, 0.8f, 0.8f };
-            Material_SetParam(mat, 0xc9, (unsigned int)defDiff, 1);
-            deMaterials.push_back(mat);
+        auto it = matCache.find("__default__");
+        P_e3_MATERIAL mat = NULL;
+        if (it != matCache.end()) {
+            mat = it->second;
+        } else {
+            mat = Scene_CreateMaterial(scene);
+            if (mat) {
+                Material_SetNameA(mat, "DefaultMaterial");
+                float defDiff[3] = { 0.8f, 0.8f, 0.8f };
+                Material_SetParam(mat, 0xc9, (unsigned int)defDiff, 1);
+                matCache["__default__"] = mat;
+            }
         }
+        if (mat) deMaterials.push_back(mat);
     } else {
         for (size_t m = 0; m < model.materials.size(); m++) {
             const auto& o3dMat = model.materials[m];
+            char mName[MAX_PATH];
+            if (!o3dMat.texFileName.empty()) {
+                const char* pSlashM = strrchr(o3dMat.texFileName.c_str(), '\\');
+                if (!pSlashM) pSlashM = strrchr(o3dMat.texFileName.c_str(), '/');
+                const char* base = pSlashM ? (pSlashM + 1) : o3dMat.texFileName.c_str();
+                strncpy(mName, base, sizeof(mName) - 1);
+                mName[sizeof(mName) - 1] = '\0';
+            } else {
+                snprintf(mName, sizeof(mName), "Material_%u", (unsigned int)m);
+            }
+
+            // Check if material already exists in cache
+            std::string cacheKey = mName;
+            auto it = matCache.find(cacheKey);
+            if (it != matCache.end() && it->second) {
+                deMaterials.push_back(it->second);
+                continue;
+            }
+
             P_e3_MATERIAL mat = Scene_CreateMaterial(scene);
             if (mat) {
-                char mName[MAX_PATH];
-                if (!o3dMat.texFileName.empty()) {
-                    const char* pSlashM = strrchr(o3dMat.texFileName.c_str(), '\\');
-                    if (!pSlashM) pSlashM = strrchr(o3dMat.texFileName.c_str(), '/');
-                    const char* base = pSlashM ? (pSlashM + 1) : o3dMat.texFileName.c_str();
-                    strncpy(mName, base, sizeof(mName) - 1);
-                    mName[sizeof(mName) - 1] = '\0';
-                } else {
-                    sprintf(mName, "Material_%u", (unsigned int)m);
-                }
                 Material_SetNameA(mat, mName);
 
                 // Diffuse Color (0xc9, type 1: 3 floats)
@@ -983,40 +965,51 @@ static unsigned int DoImport(P_e3_STREAM stream, P_e3_SCENE scene) {
                 // Texture map (0x4008: string, 0x4001: flags)
                 if (!o3dMat.texFileName.empty()) {
                     std::string finalTexPath = o3dMat.texFileName;
-                    if (modelDir[0] != L'\0') {
-                        wchar_t candidate[MAX_PATH];
+                    wchar_t candidate[MAX_PATH];
+                    bool found = false;
+
+                    const wchar_t* dirsToCheck[] = { modelDir, baseDir };
+                    for (const wchar_t* d : dirsToCheck) {
+                        if (!d || d[0] == L'\0') continue;
+
                         // 1. Check same directory
-                        swprintf(candidate, MAX_PATH, L"%ls\\%hs", modelDir, o3dMat.texFileName.c_str());
+                        swprintf(candidate, MAX_PATH, L"%ls\\%hs", d, o3dMat.texFileName.c_str());
                         if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) {
                             char cBuf[MAX_PATH];
                             WideCharToMultiByte(CP_ACP, 0, candidate, -1, cBuf, MAX_PATH, NULL, NULL);
                             finalTexPath = cBuf;
-                        } else {
-                            // 2. Check Texture/ or ../Texture or ../../Texture
-                            const wchar_t* subDirs[] = {
-                                L"%ls\\Texture\\%hs",
-                                L"%ls\\..\\Texture\\%hs",
-                                L"%ls\\..\\..\\Texture\\%hs",
-                                L"%ls\\texture\\%hs",
-                                L"%ls\\..\\texture\\%hs",
-                                L"%ls\\..\\..\\texture\\%hs"
-                            };
-                            for (const auto* fmt : subDirs) {
-                                swprintf(candidate, MAX_PATH, fmt, modelDir, o3dMat.texFileName.c_str());
-                                if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) {
-                                    char cBuf[MAX_PATH];
-                                    WideCharToMultiByte(CP_ACP, 0, candidate, -1, cBuf, MAX_PATH, NULL, NULL);
-                                    finalTexPath = cBuf;
-                                    break;
-                                }
+                            found = true;
+                            break;
+                        }
+
+                        // 2. Check Texture/ or ../Texture or ../../Texture
+                        const wchar_t* subDirs[] = {
+                            L"%ls\\Texture\\%hs",
+                            L"%ls\\..\\Texture\\%hs",
+                            L"%ls\\..\\..\\Texture\\%hs",
+                            L"%ls\\texture\\%hs",
+                            L"%ls\\..\\texture\\%hs",
+                            L"%ls\\..\\..\\texture\\%hs"
+                        };
+                        for (const auto* fmt : subDirs) {
+                            swprintf(candidate, MAX_PATH, fmt, d, o3dMat.texFileName.c_str());
+                            if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) {
+                                char cBuf[MAX_PATH];
+                                WideCharToMultiByte(CP_ACP, 0, candidate, -1, cBuf, MAX_PATH, NULL, NULL);
+                                finalTexPath = cBuf;
+                                found = true;
+                                break;
                             }
                         }
+                        if (found) break;
                     }
+
                     Material_SetParam(mat, 0x4008, (unsigned int)finalTexPath.c_str(), 0xc);
                     unsigned int flags = Material_GetParam(mat, 0x4001, 0, 1);
                     Material_SetParam(mat, 0x4001, flags | 8, 1); // Enable texture mapping
                 }
 
+                matCache[cacheKey] = mat;
                 deMaterials.push_back(mat);
             }
         }
@@ -1047,7 +1040,7 @@ static unsigned int DoImport(P_e3_STREAM stream, P_e3_SCENE scene) {
     Matrix4x4_Identity(&dePivotMat);
     bool hasPivot = false;
 
-    if (model.has_matrix) {
+    if (model.has_matrix && preservePivot) {
         OmsiMatrixToDEMatrix(model.matrix, &dePivotMat);
         hasPivot = !Matrix4x4_IsIdentity(&dePivotMat);
     }
@@ -1158,7 +1151,7 @@ static unsigned int DoImport(P_e3_STREAM stream, P_e3_SCENE scene) {
     }
 
     // Back up original matrix
-    if (model.has_matrix) {
+    if (model.has_matrix && preservePivot) {
         std::vector<float> matVec(model.matrix, model.matrix + 16);
         s_originalMatrix[node] = matVec;
         s_originalMatrix[mesh] = matVec;
@@ -1166,8 +1159,200 @@ static unsigned int DoImport(P_e3_STREAM stream, P_e3_SCENE scene) {
         s_hasLastImportedMatrix = true;
     }
 
-    PluginLog("DoImport: Successfully imported %u vertices, %u faces, %u materials (hasPivot=%d)\n",
+    PluginLog("ImportMeshToScene: Successfully imported %u vertices, %u faces, %u materials (hasPivot=%d)\n",
               numVerts, numFaces, (unsigned int)model.materials.size(), (int)hasPivot);
+    return true;
+}
+
+static unsigned int DoImportConfig(P_e3_SCENE scene, const wchar_t* cfgPath, bool preservePivot) {
+    PluginLog("DoImportConfig: Parsing OMSI model config '%ls'\n", cfgPath);
+
+    FILE* f = _wfopen(cfgPath, L"r");
+    if (!f) {
+        PluginLog("DoImportConfig: Failed to open '%ls'\n", cfgPath);
+        return 0;
+    }
+
+    wchar_t baseDir[MAX_PATH] = {0};
+    wcscpy(baseDir, cfgPath);
+    wchar_t* pSep = wcsrchr(baseDir, L'\\');
+    if (!pSep) pSep = wcsrchr(baseDir, L'/');
+    if (pSep) *pSep = L'\0';
+
+    std::map<std::string, P_e3_MATERIAL> matCache;
+    std::map<std::string, int> nameCounts;
+    int importedCount = 0;
+    int totalMeshesFound = 0;
+
+    char line[1024];
+    bool firstLine = true;
+
+    while (fgets(line, sizeof(line), f)) {
+        char* start = line;
+        if (firstLine) {
+            firstLine = false;
+            // Skip UTF-8 BOM if present
+            if ((unsigned char)start[0] == 0xEF && (unsigned char)start[1] == 0xBB && (unsigned char)start[2] == 0xBF) {
+                start += 3;
+            }
+        }
+
+        // Trim leading whitespace
+        while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+        // Trim trailing whitespace
+        char* end = start + strlen(start);
+        while (end > start && (*(end - 1) == ' ' || *(end - 1) == '\t' || *(end - 1) == '\r' || *(end - 1) == '\n')) {
+            end--;
+            *end = '\0';
+        }
+
+        if (_stricmp(start, "[mesh]") == 0) {
+            totalMeshesFound++;
+
+            // Read the next non-empty, non-comment line containing the relative path to .o3d
+            char meshRelPath[MAX_PATH] = {0};
+            while (fgets(line, sizeof(line), f)) {
+                char* mstart = line;
+                while (*mstart == ' ' || *mstart == '\t' || *mstart == '\r' || *mstart == '\n') mstart++;
+                char* mend = mstart + strlen(mstart);
+                while (mend > mstart && (*(mend - 1) == ' ' || *(mend - 1) == '\t' || *(mend - 1) == '\r' || *(mend - 1) == '\n')) {
+                    mend--;
+                    *mend = '\0';
+                }
+                if (mstart[0] == '\0' || mstart[0] == '\'' || (mstart[0] == '/' && mstart[1] == '/'))
+                    continue;
+
+                // Handle inline comments
+                char* pInline = strstr(mstart, "//");
+                if (pInline) {
+                    *pInline = '\0';
+                    while (pInline > mstart && (*(pInline - 1) == ' ' || *(pInline - 1) == '\t')) {
+                        pInline--;
+                        *pInline = '\0';
+                    }
+                }
+
+                strncpy(meshRelPath, mstart, MAX_PATH - 1);
+                break;
+            }
+
+            if (meshRelPath[0] == '\0' || meshRelPath[0] == '[') {
+                continue;
+            }
+
+            wchar_t relPathW[MAX_PATH];
+            MultiByteToWideChar(CP_ACP, 0, meshRelPath, -1, relPathW, MAX_PATH);
+            for (int i = 0; relPathW[i]; i++) {
+                if (relPathW[i] == L'/') relPathW[i] = L'\\';
+            }
+
+            wchar_t fullMeshPath[MAX_PATH];
+            swprintf(fullMeshPath, MAX_PATH, L"%ls\\%ls", baseDir, relPathW);
+
+            O3D_Model model;
+            if (ReadO3DFile(fullMeshPath, model)) {
+                char rawName[MAX_PATH];
+                const char* pSlash = strrchr(meshRelPath, '\\');
+                if (!pSlash) pSlash = strrchr(meshRelPath, '/');
+                const char* baseName = pSlash ? (pSlash + 1) : meshRelPath;
+                strncpy(rawName, baseName, sizeof(rawName) - 1);
+                rawName[sizeof(rawName) - 1] = '\0';
+                char* pDot = strrchr(rawName, '.');
+                if (pDot) *pDot = '\0';
+
+                // Disambiguate duplicate names in the scene tree
+                char nodeName[MAX_PATH];
+                int count = ++nameCounts[rawName];
+                if (count > 1) {
+                    snprintf(nodeName, sizeof(nodeName), "%s_%d", rawName, count - 1);
+                } else {
+                    strncpy(nodeName, rawName, sizeof(nodeName) - 1);
+                    nodeName[sizeof(nodeName) - 1] = '\0';
+                }
+
+                wchar_t meshDir[MAX_PATH];
+                wcscpy(meshDir, fullMeshPath);
+                wchar_t* pM = wcsrchr(meshDir, L'\\');
+                if (!pM) pM = wcsrchr(meshDir, L'/');
+                if (pM) *pM = L'\0';
+
+                if (ImportMeshToScene(scene, model, nodeName, meshDir, baseDir, preservePivot, matCache)) {
+                    importedCount++;
+                }
+            } else {
+                PluginLog("DoImportConfig: Warning: Could not read mesh file '%ls'\n", fullMeshPath);
+            }
+        }
+    }
+
+    fclose(f);
+    PluginLog("DoImportConfig: Done! Found %d mesh tags, successfully imported %d meshes, unique materials: %u\n",
+              totalMeshesFound, importedCount, (unsigned int)matCache.size());
+
+    return (importedCount > 0) ? 1 : 0;
+}
+
+static unsigned int DoImport(P_e3_STREAM stream, P_e3_SCENE scene, void* options = NULL) {
+    wchar_t filePath[MAX_PATH] = {0};
+    bool resW = Stream_GetFileNameW(stream, filePath, MAX_PATH);
+    PluginLog("Stream_GetFileNameW returned %d: '%ls', options: %p\n", (int)resW, filePath, options);
+
+    if (filePath[0] == L'\0') {
+        PluginLog("DoImport: Empty filePath, cannot proceed\n");
+        return 0;
+    }
+
+    bool preservePivot = true;
+    if (options && !IsBadReadPtr(options, sizeof(void*))) {
+        void** opt_vt = *(void***)options;
+        if (opt_vt && !IsBadReadPtr(opt_vt, 15 * sizeof(void*))) {
+            typedef int (__stdcall *GetOptionIntFunc)(void* options, const GUID* guid, const char* name, int defVal);
+            GetOptionIntFunc getOptionInt = (GetOptionIntFunc)opt_vt[14];
+            if (getOptionInt && !IsBadCodePtr((FARPROC)getOptionInt)) {
+                int val = getOptionInt(options, &O3D_TYPE_GUID, "i_pivot", 1);
+                preservePivot = (val != 0);
+                PluginLog("DoImport: Option 'i_pivot' = %d (preservePivot = %s)\n", val, preservePivot ? "true" : "false");
+            }
+        }
+    }
+
+    // Check if the opened file is an OMSI model config (.cfg)
+    const wchar_t* pExt = wcsrchr(filePath, L'.');
+    if (pExt && _wcsicmp(pExt, L".cfg") == 0) {
+        return DoImportConfig(scene, filePath, preservePivot);
+    }
+
+    // Single .o3d file import
+    O3D_Model model;
+    if (!ReadO3DFile(filePath, model)) {
+        PluginLog("DoImport: ReadO3DFile failed for '%ls'\n", filePath);
+        return 0;
+    }
+
+    wchar_t modelDir[MAX_PATH] = {0};
+    wcscpy(modelDir, filePath);
+    wchar_t* pSep = wcsrchr(modelDir, L'\\');
+    if (!pSep) pSep = wcsrchr(modelDir, L'/');
+    if (pSep) *pSep = L'\0';
+
+    char nodeName[MAX_PATH] = "O3D_Mesh";
+    const wchar_t* pSlash = wcsrchr(filePath, L'\\');
+    if (!pSlash) pSlash = wcsrchr(filePath, L'/');
+    if (pSlash) {
+        wchar_t wBase[MAX_PATH];
+        wcscpy(wBase, pSlash + 1);
+        wchar_t* pDot = wcsrchr(wBase, L'.');
+        if (pDot) *pDot = L'\0';
+        WideCharToMultiByte(CP_ACP, 0, wBase, -1, nodeName, MAX_PATH, NULL, NULL);
+    }
+
+    std::map<std::string, P_e3_MATERIAL> matCache;
+    if (!ImportMeshToScene(scene, model, nodeName, modelDir, NULL, preservePivot, matCache)) {
+        PluginLog("DoImport: ImportMeshToScene failed\n");
+        return 0;
+    }
+
+    PluginLog("DoImport: Successfully imported single model '%ls'\n", filePath);
     return 1;
 }
 
@@ -1551,7 +1736,7 @@ static unsigned int __stdcall O3D_Callback(unsigned int action, void* stream, vo
     PluginLog("O3D_Callback: action=%u, stream=%p, scene=%p, options=%p\n", action, stream, scene, options);
     switch (action) {
         case 1: // Import / Open
-            return DoImport((P_e3_STREAM)stream, (P_e3_SCENE)scene);
+            return DoImport((P_e3_STREAM)stream, (P_e3_SCENE)scene, options);
 
         case 2: // Export / Save
             return DoExport((P_e3_STREAM)stream, (P_e3_SCENE)scene);
@@ -1595,7 +1780,30 @@ extern "C" __declspec(dllexport) unsigned int __stdcall E3DLLFunc(unsigned int m
             void* cookie = arg3;
             if (!host) return 0;
 
+            // Remove any stale ghost registry key left behind from previous misaligned debug builds
+            RegDeleteKeyA(HKEY_CURRENT_USER, "Software\\Right Hemisphere\\Deep Exploration57\\Plugins\\{53494F4D-0032-0000-0000-00013D0E8419}");
+
             void** host_vt = *(void***)host;
+
+            // Remove any ghost or duplicate o3d entries from host->typesArray (e.g. from a stale disk cache)
+            void* typesArray = *(void**)((char*)host + 0x20);
+            if (typesArray) {
+                int count = *(int*)((char*)typesArray + 0x1c);
+                void** items = *(void***)((char*)typesArray + 0x18);
+                void** arr_vt = *(void***)typesArray;
+                typedef BOOL (__stdcall *RemoveAtFunc)(void*, int);
+                RemoveAtFunc removeAt = (RemoveAtFunc)arr_vt[10]; // offset 0x28
+
+                for (int i = count - 1; i >= 0; --i) {
+                    char* item = (char*)items[i];
+                    if (!item) continue;
+                    const wchar_t* ext = *(const wchar_t**)(item + 8);
+                    if (ext && (_wcsicmp(ext, L"o3d") == 0 || _wcsicmp(ext, L"cfg") == 0)) {
+                        PluginLog("E3DLLFunc: Removing existing/ghost %ls entry at index %d\n", ext, i);
+                        removeAt(typesArray, i);
+                    }
+                }
+            }
 
             typedef void* (__stdcall *Func2)(void*, void*);
             Func2 getCookie2 = (Func2)host_vt[2];
@@ -1603,20 +1811,42 @@ extern "C" __declspec(dllexport) unsigned int __stdcall E3DLLFunc(unsigned int m
 
             DE_FILETYPE_REG reg;
             memset(&reg, 0, sizeof(reg));
-            reg.size = 0x52; // 82 bytes
-            reg.flags = 0x23c01; // Can import (0x1), Can export (0x20000), 3D format (0x800), Mesh (0x400), Materials (0x2000), Has Options (0x1000)
+            reg.size = sizeof(DE_FILETYPE_REG); // 0x52 (82 bytes)
+            reg.flags = 0x22c01; // Can import (0x1), Can export (0x20000), 3D format (0x800), Mesh (0x400), Materials (0x2000)
             reg.ext = L"o3d";
             reg.desc = L"OMSI 2 3D Model";
-            reg.guid1 = O3D_TYPE_GUID;
-            reg.cookie = (DWORD)cookie;
+            reg.formatInfo[0] = NULL;
+            reg.formatInfo[1] = NULL;
+            reg.formatInfo[2] = NULL;
+            reg.formatInfo[3] = NULL;
+            reg.hInstance = (HINSTANCE)cookie ? (HINSTANCE)cookie : (HINSTANCE)g_hModule;
             reg.optName = NULL;
             reg.callback = (void*)O3D_Callback;
-            reg.e3_type = O3D_TYPE_GUID; // Non-zero GUID required by Deep Exploration
+            reg.guid1 = O3D_TYPE_GUID;
+            reg.guid2 = O3D_TYPE_GUID;
 
             typedef unsigned int (__stdcall *RegisterFunc)(void*, void*);
             RegisterFunc registerType = (RegisterFunc)host_vt[10];
             unsigned int res = registerType(host, &reg);
-            PluginLog("E3DLLFunc: Registered O3D format with code %u\n", res);
+            PluginLog("E3DLLFunc: Registered O3D format with code %u (hInstance=%p)\n", res, reg.hInstance);
+
+            DE_FILETYPE_REG regCfg;
+            memset(&regCfg, 0, sizeof(regCfg));
+            regCfg.size = sizeof(DE_FILETYPE_REG); // 0x52 (82 bytes)
+            regCfg.flags = 0x2801; // Can import (0x1), 3D format (0x800), Mesh (0x400), Materials (0x2000)
+            regCfg.ext = L"cfg";
+            regCfg.desc = L"OMSI 2 Model Config";
+            regCfg.formatInfo[0] = NULL;
+            regCfg.formatInfo[1] = NULL;
+            regCfg.formatInfo[2] = NULL;
+            regCfg.formatInfo[3] = NULL;
+            regCfg.hInstance = (HINSTANCE)cookie ? (HINSTANCE)cookie : (HINSTANCE)g_hModule;
+            regCfg.optName = NULL;
+            regCfg.callback = (void*)O3D_Callback;
+            regCfg.guid1 = O3D_CFG_TYPE_GUID;
+            regCfg.guid2 = O3D_CFG_TYPE_GUID;
+            unsigned int resCfg = registerType(host, &regCfg);
+            PluginLog("E3DLLFunc: Registered CFG format with code %u (hInstance=%p)\n", resCfg, regCfg.hInstance);
             return 5;
         }
 
