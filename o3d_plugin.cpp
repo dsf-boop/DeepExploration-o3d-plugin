@@ -89,6 +89,12 @@ struct O3D_Material {
     float emissiveColor[3]; // RGB
     float power;
     std::string texFileName;
+
+    O3D_Material() : power(0.0f) {
+        faceColor[0] = faceColor[1] = faceColor[2] = faceColor[3] = 1.0f;
+        specularColor[0] = specularColor[1] = specularColor[2] = 0.0f;
+        emissiveColor[0] = emissiveColor[1] = emissiveColor[2] = 0.0f;
+    }
 };
 
 struct O3D_BoneWeight {
@@ -469,6 +475,466 @@ static bool WriteO3DFile(const wchar_t* filePath, const O3D_Model& model) {
     fclose(f);
     return true;
 }
+
+// -------------------------------------------------------------
+// DirectX .X (ASCII) File Reader for OMSI 2 Config Importer
+// -------------------------------------------------------------
+
+struct X_NamedMesh {
+    std::string name;
+    O3D_Model model;
+};
+
+struct XTokenizer {
+    const char* ptr;
+    const char* end;
+
+    XTokenizer(const char* buf, size_t len) : ptr(buf), end(buf + len) {}
+
+    void SkipWhitespaceAndComments() {
+        while (ptr < end) {
+            char c = *ptr;
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                ptr++;
+                continue;
+            }
+            if (c == '#' || (c == '/' && ptr + 1 < end && ptr[1] == '/')) {
+                ptr += 2;
+                while (ptr < end && *ptr != '\n') ptr++;
+                continue;
+            }
+            if (c == '/' && ptr + 1 < end && ptr[1] == '*') {
+                ptr += 2;
+                while (ptr + 1 < end && !(ptr[0] == '*' && ptr[1] == '/')) ptr++;
+                if (ptr + 1 < end) ptr += 2;
+                continue;
+            }
+            break;
+        }
+    }
+
+    bool NextValue(std::string& outTok) {
+        while (true) {
+            SkipWhitespaceAndComments();
+            if (ptr >= end) return false;
+
+            char c = *ptr;
+            if (c == ';' || c == ',') {
+                ptr++;
+                continue;
+            }
+            if (c == '{' || c == '}') {
+                outTok.assign(1, c);
+                ptr++;
+                return true;
+            }
+            if (c == '"') {
+                ptr++;
+                const char* start = ptr;
+                while (ptr < end && *ptr != '"') ptr++;
+                outTok.assign(start, ptr - start);
+                if (ptr < end) ptr++;
+                return true;
+            }
+
+            const char* start = ptr;
+            while (ptr < end) {
+                char ch = *ptr;
+                if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' ||
+                    ch == ';' || ch == ',' || ch == '{' || ch == '}' || ch == '"') {
+                    break;
+                }
+                ptr++;
+            }
+            outTok.assign(start, ptr - start);
+            return true;
+        }
+    }
+
+    float GetFloat() {
+        std::string tok;
+        if (!NextValue(tok)) return 0.0f;
+        return (float)atof(tok.c_str());
+    }
+
+    int GetInt() {
+        std::string tok;
+        if (!NextValue(tok)) return 0;
+        return atoi(tok.c_str());
+    }
+
+    void SkipBlock() {
+        int depth = 1;
+        std::string tok;
+        while (depth > 0 && NextValue(tok)) {
+            if (tok == "{") depth++;
+            else if (tok == "}") depth--;
+        }
+    }
+};
+
+static inline void X_MultiplyMatrix4x4(const float* a, const float* b, float* out) {
+    float temp[16];
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            float s = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                s += a[r * 4 + k] * b[k * 4 + c];
+            }
+            temp[r * 4 + c] = s;
+        }
+    }
+    memcpy(out, temp, sizeof(temp));
+}
+
+static inline void X_TransformVec3(const float* m, float x, float y, float z, float& ox, float& oy, float& oz) {
+    ox = x * m[0] + y * m[4] + z * m[8]  + m[12];
+    oy = x * m[1] + y * m[5] + z * m[9]  + m[13];
+    oz = x * m[2] + y * m[6] + z * m[10] + m[14];
+}
+
+static inline void X_TransformNormal(const float* m, float nx, float ny, float nz, float& onx, float& ony, float& onz) {
+    onx = nx * m[0] + ny * m[4] + nz * m[8];
+    ony = nx * m[1] + ny * m[5] + nz * m[9];
+    onz = nx * m[2] + ny * m[6] + nz * m[10];
+    float len = sqrtf(onx * onx + ony * ony + onz * onz);
+    if (len > 1e-6f) {
+        onx /= len;
+        ony /= len;
+        onz /= len;
+    }
+}
+
+static O3D_Material X_ParseMaterial(XTokenizer& tok, const std::string& name) {
+    O3D_Material mat;
+    mat.faceColor[0] = tok.GetFloat();
+    mat.faceColor[1] = tok.GetFloat();
+    mat.faceColor[2] = tok.GetFloat();
+    mat.faceColor[3] = tok.GetFloat();
+    mat.power = tok.GetFloat();
+    mat.specularColor[0] = tok.GetFloat();
+    mat.specularColor[1] = tok.GetFloat();
+    mat.specularColor[2] = tok.GetFloat();
+    mat.emissiveColor[0] = tok.GetFloat();
+    mat.emissiveColor[1] = tok.GetFloat();
+    mat.emissiveColor[2] = tok.GetFloat();
+
+    std::string subTok;
+    while (tok.NextValue(subTok)) {
+        if (subTok == "}") break;
+        if (subTok == "TextureFilename") {
+            std::string ob; tok.NextValue(ob);
+            tok.NextValue(mat.texFileName);
+            while (tok.NextValue(subTok) && subTok != "}");
+        } else if (subTok == "{") {
+            tok.SkipBlock();
+        }
+    }
+    return mat;
+}
+
+static void X_ParseMesh(XTokenizer& tok, const std::string& meshName, const float* transformMatrix,
+                        const std::map<std::string, O3D_Material>& globalMaterials,
+                        std::vector<X_NamedMesh>& outMeshes) {
+    int numVerts = tok.GetInt();
+    std::vector<Vector3D> rawPositions(numVerts);
+    for (int v = 0; v < numVerts; v++) {
+        rawPositions[v].x = tok.GetFloat();
+        rawPositions[v].y = tok.GetFloat();
+        rawPositions[v].z = tok.GetFloat();
+    }
+
+    int numFaces = tok.GetInt();
+    struct RawFace {
+        std::vector<uint32_t> idx;
+    };
+    std::vector<RawFace> rawFaces(numFaces);
+    for (int f = 0; f < numFaces; f++) {
+        int nv = tok.GetInt();
+        rawFaces[f].idx.resize(nv);
+        for (int k = 0; k < nv; k++) {
+            rawFaces[f].idx[k] = (uint32_t)tok.GetInt();
+        }
+    }
+
+    std::vector<Vector3D> rawNormals;
+    std::vector<Vector2D> rawUVs;
+    std::vector<O3D_Material> materials;
+    std::vector<uint16_t> faceMatIndices;
+
+    std::string subTok;
+    while (tok.NextValue(subTok)) {
+        if (subTok == "}") break; // end of Mesh
+        if (subTok == "MeshNormals") {
+            std::string ob; tok.NextValue(ob);
+            int nNorms = tok.GetInt();
+            rawNormals.resize(nNorms);
+            for (int i = 0; i < nNorms; i++) {
+                rawNormals[i].x = tok.GetFloat();
+                rawNormals[i].y = tok.GetFloat();
+                rawNormals[i].z = tok.GetFloat();
+            }
+            int nFaceNorms = tok.GetInt();
+            for (int i = 0; i < nFaceNorms; i++) {
+                int nv = tok.GetInt();
+                for (int k = 0; k < nv; k++) {
+                    tok.GetInt();
+                }
+            }
+            std::string t;
+            while (tok.NextValue(t) && t != "}");
+        }
+        else if (subTok == "MeshTextureCoords") {
+            std::string ob; tok.NextValue(ob);
+            int nUVs = tok.GetInt();
+            rawUVs.resize(nUVs);
+            for (int i = 0; i < nUVs; i++) {
+                rawUVs[i].x = tok.GetFloat();
+                rawUVs[i].y = tok.GetFloat();
+            }
+            std::string t;
+            while (tok.NextValue(t) && t != "}");
+        }
+        else if (subTok == "MeshMaterialList") {
+            std::string ob; tok.NextValue(ob);
+            int nMats = tok.GetInt();
+            int nFaceMat = tok.GetInt();
+            faceMatIndices.resize(nFaceMat);
+            for (int i = 0; i < nFaceMat; i++) {
+                faceMatIndices[i] = (uint16_t)tok.GetInt();
+            }
+            std::string mTok;
+            while (tok.NextValue(mTok)) {
+                if (mTok == "}") break;
+                if (mTok == "Material") {
+                    std::string mName;
+                    tok.NextValue(mName);
+                    if (mName != "{") {
+                        std::string mb; tok.NextValue(mb);
+                    }
+                    materials.push_back(X_ParseMaterial(tok, mName));
+                } else if (mTok == "{") {
+                    std::string refName;
+                    tok.NextValue(refName);
+                    if (refName != "}") {
+                        auto it = globalMaterials.find(refName);
+                        if (it != globalMaterials.end()) {
+                            materials.push_back(it->second);
+                        }
+                        std::string closeB;
+                        while (tok.NextValue(closeB) && closeB != "}");
+                    }
+                }
+            }
+        }
+        else if (subTok == "{") {
+            tok.SkipBlock();
+        }
+        else {
+            std::string peek;
+            if (tok.NextValue(peek)) {
+                if (peek == "{") tok.SkipBlock();
+            }
+        }
+    }
+
+    X_NamedMesh xmesh;
+    xmesh.name = meshName;
+    O3D_Model& model = xmesh.model;
+
+    bool hasTransform = false;
+    if (transformMatrix) {
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 4; c++) {
+                float exp = (r == c) ? 1.0f : 0.0f;
+                if (fabs(transformMatrix[r * 4 + c] - exp) > 1e-4f) {
+                    hasTransform = true;
+                    break;
+                }
+            }
+            if (hasTransform) break;
+        }
+    }
+
+    model.vertices.resize(numVerts);
+    for (int i = 0; i < numVerts; i++) {
+        float x = rawPositions[i].x;
+        float y = rawPositions[i].y;
+        float z = rawPositions[i].z;
+
+        float nx = (i < (int)rawNormals.size()) ? rawNormals[i].x : 0.0f;
+        float ny = (i < (int)rawNormals.size()) ? rawNormals[i].y : 1.0f;
+        float nz = (i < (int)rawNormals.size()) ? rawNormals[i].z : 0.0f;
+
+        if (hasTransform) {
+            float tx, ty, tz;
+            X_TransformVec3(transformMatrix, x, y, z, tx, ty, tz);
+            x = tx; y = ty; z = tz;
+
+            float tnx, tny, tnz;
+            X_TransformNormal(transformMatrix, nx, ny, nz, tnx, tny, tnz);
+            nx = tnx; ny = tny; nz = tnz;
+        }
+
+        model.vertices[i].position.x = x;
+        model.vertices[i].position.y = y;
+        model.vertices[i].position.z = z;
+
+        model.vertices[i].normal.x = nx;
+        model.vertices[i].normal.y = ny;
+        model.vertices[i].normal.z = nz;
+
+        if (i < (int)rawUVs.size()) {
+            model.vertices[i].uv = rawUVs[i];
+        } else {
+            model.vertices[i].uv.x = 0.0f;
+            model.vertices[i].uv.y = 0.0f;
+        }
+    }
+
+    for (size_t f = 0; f < rawFaces.size(); f++) {
+        const auto& poly = rawFaces[f].idx;
+        if (poly.size() < 3) continue;
+
+        uint16_t matId = (f < faceMatIndices.size()) ? faceMatIndices[f] : 0;
+        if (materials.empty()) matId = 0;
+        else if (matId >= materials.size()) matId = 0;
+
+        for (size_t k = 2; k < poly.size(); k++) {
+            O3D_Face tri;
+            tri.a = poly[0];
+            tri.b = poly[k - 1];
+            tri.c = poly[k];
+            tri.material_id = matId;
+            model.faces.push_back(tri);
+        }
+    }
+
+    model.materials = materials;
+    model.has_matrix = false;
+    memset(model.matrix, 0, sizeof(model.matrix));
+    model.matrix[0] = model.matrix[5] = model.matrix[10] = model.matrix[15] = 1.0f;
+
+    outMeshes.push_back(xmesh);
+}
+
+static bool ReadXFile(const wchar_t* filePath, std::vector<X_NamedMesh>& outMeshes) {
+    outMeshes.clear();
+    FILE* f = _wfopen(filePath, L"rb");
+    if (!f) {
+        PluginLog("ReadXFile: Failed to open '%ls'\n", filePath);
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 16) {
+        fclose(f);
+        return false;
+    }
+
+    std::vector<char> buf(fsize + 1);
+    fread(buf.data(), 1, fsize, f);
+    buf[fsize] = '\0';
+    fclose(f);
+
+    if (strncmp(buf.data(), "xof ", 4) != 0) {
+        PluginLog("ReadXFile: Invalid .x header in '%ls'\n", filePath);
+        return false;
+    }
+
+    if (fsize < 16 || buf[8] != 't' || buf[9] != 'x' || buf[10] != 't') {
+        PluginLog("ReadXFile: Binary .x files are not supported: '%ls'\n", filePath);
+        return false;
+    }
+
+    XTokenizer tok(buf.data(), fsize);
+    std::string headerTok;
+    tok.NextValue(headerTok);
+
+    std::vector<std::vector<float>> matrixStack;
+    std::vector<float> ident(16, 0.0f);
+    ident[0] = ident[5] = ident[10] = ident[15] = 1.0f;
+    matrixStack.push_back(ident);
+
+    std::map<std::string, O3D_Material> globalMaterials;
+
+    std::string token;
+    while (tok.NextValue(token)) {
+        if (token == "template") {
+            std::string tname;
+            tok.NextValue(tname);
+            if (tname != "{") {
+                std::string ob; tok.NextValue(ob);
+            }
+            tok.SkipBlock();
+        }
+        else if (token == "Frame") {
+            std::string fname;
+            tok.NextValue(fname);
+            if (fname != "{") {
+                std::string ob; tok.NextValue(ob);
+            }
+            matrixStack.push_back(matrixStack.back());
+        }
+        else if (token == "FrameTransformMatrix") {
+            std::string ob; tok.NextValue(ob);
+            float localMat[16];
+            for (int i = 0; i < 16; i++) {
+                localMat[i] = tok.GetFloat();
+            }
+            std::string t;
+            while (tok.NextValue(t) && t != "}");
+
+            if (matrixStack.size() >= 2) {
+                float combined[16];
+                X_MultiplyMatrix4x4(localMat, matrixStack[matrixStack.size() - 2].data(), combined);
+                memcpy(matrixStack.back().data(), combined, 16 * sizeof(float));
+            } else {
+                memcpy(matrixStack.back().data(), localMat, 16 * sizeof(float));
+            }
+        }
+        else if (token == "Mesh") {
+            std::string mname;
+            tok.NextValue(mname);
+            if (mname != "{") {
+                std::string ob; tok.NextValue(ob);
+            } else {
+                mname = "Mesh";
+            }
+            X_ParseMesh(tok, mname, matrixStack.back().data(), globalMaterials, outMeshes);
+        }
+        else if (token == "Material") {
+            std::string mname;
+            tok.NextValue(mname);
+            if (mname != "{") {
+                std::string ob; tok.NextValue(ob);
+            } else {
+                mname = "Material";
+            }
+            O3D_Material mat = X_ParseMaterial(tok, mname);
+            globalMaterials[mname] = mat;
+        }
+        else if (token == "}") {
+            if (matrixStack.size() > 1) {
+                matrixStack.pop_back();
+            }
+        }
+        else if (token == "{") {
+            tok.SkipBlock();
+        }
+        else {
+            std::string peek;
+            if (tok.NextValue(peek)) {
+                if (peek == "{") tok.SkipBlock();
+            }
+        }
+    }
+
+    PluginLog("ReadXFile: Successfully parsed %ls: %u meshes found\n", filePath, (unsigned int)outMeshes.size());
+    return !outMeshes.empty();
+}
+
 
 // -------------------------------------------------------------
 // Deep Exploration 5.7 SDK Virtual Tables & Structures
@@ -1249,38 +1715,74 @@ static unsigned int DoImportConfig(P_e3_SCENE scene, const wchar_t* cfgPath, boo
             wchar_t fullMeshPath[MAX_PATH];
             swprintf(fullMeshPath, MAX_PATH, L"%ls\\%ls", baseDir, relPathW);
 
-            O3D_Model model;
-            if (ReadO3DFile(fullMeshPath, model)) {
-                char rawName[MAX_PATH];
-                const char* pSlash = strrchr(meshRelPath, '\\');
-                if (!pSlash) pSlash = strrchr(meshRelPath, '/');
-                const char* baseName = pSlash ? (pSlash + 1) : meshRelPath;
-                strncpy(rawName, baseName, sizeof(rawName) - 1);
-                rawName[sizeof(rawName) - 1] = '\0';
-                char* pDot = strrchr(rawName, '.');
-                if (pDot) *pDot = '\0';
+            wchar_t meshDir[MAX_PATH];
+            wcscpy(meshDir, fullMeshPath);
+            wchar_t* pM = wcsrchr(meshDir, L'\\');
+            if (!pM) pM = wcsrchr(meshDir, L'/');
+            if (pM) *pM = L'\0';
 
-                // Disambiguate duplicate names in the scene tree
-                char nodeName[MAX_PATH];
-                int count = ++nameCounts[rawName];
-                if (count > 1) {
-                    snprintf(nodeName, sizeof(nodeName), "%s_%d", rawName, count - 1);
+            char rawName[MAX_PATH];
+            const char* pSlash = strrchr(meshRelPath, '\\');
+            if (!pSlash) pSlash = strrchr(meshRelPath, '/');
+            const char* baseName = pSlash ? (pSlash + 1) : meshRelPath;
+            strncpy(rawName, baseName, sizeof(rawName) - 1);
+            rawName[sizeof(rawName) - 1] = '\0';
+            char* pDot = strrchr(rawName, '.');
+            if (pDot) *pDot = '\0';
+
+            const wchar_t* pMeshExt = wcsrchr(fullMeshPath, L'.');
+            bool isX = (pMeshExt && _wcsicmp(pMeshExt, L".x") == 0);
+
+            if (isX) {
+                std::vector<X_NamedMesh> xMeshes;
+                if (ReadXFile(fullMeshPath, xMeshes)) {
+                    for (size_t mIdx = 0; mIdx < xMeshes.size(); mIdx++) {
+                        char baseNodeName[MAX_PATH];
+                        if (xMeshes.size() == 1) {
+                            strncpy(baseNodeName, rawName, sizeof(baseNodeName) - 1);
+                        } else {
+                            if (!xMeshes[mIdx].name.empty()) {
+                                snprintf(baseNodeName, sizeof(baseNodeName), "%s_%s", rawName, xMeshes[mIdx].name.c_str());
+                            } else {
+                                snprintf(baseNodeName, sizeof(baseNodeName), "%s_%u", rawName, (unsigned int)mIdx);
+                            }
+                        }
+                        baseNodeName[sizeof(baseNodeName) - 1] = '\0';
+
+                        char nodeName[MAX_PATH];
+                        int count = ++nameCounts[baseNodeName];
+                        if (count > 1) {
+                            snprintf(nodeName, sizeof(nodeName), "%s_%d", baseNodeName, count - 1);
+                        } else {
+                            strncpy(nodeName, baseNodeName, sizeof(nodeName) - 1);
+                            nodeName[sizeof(nodeName) - 1] = '\0';
+                        }
+
+                        if (ImportMeshToScene(scene, xMeshes[mIdx].model, nodeName, meshDir, baseDir, preservePivot, matCache)) {
+                            importedCount++;
+                        }
+                    }
                 } else {
-                    strncpy(nodeName, rawName, sizeof(nodeName) - 1);
-                    nodeName[sizeof(nodeName) - 1] = '\0';
-                }
-
-                wchar_t meshDir[MAX_PATH];
-                wcscpy(meshDir, fullMeshPath);
-                wchar_t* pM = wcsrchr(meshDir, L'\\');
-                if (!pM) pM = wcsrchr(meshDir, L'/');
-                if (pM) *pM = L'\0';
-
-                if (ImportMeshToScene(scene, model, nodeName, meshDir, baseDir, preservePivot, matCache)) {
-                    importedCount++;
+                    PluginLog("DoImportConfig: Warning: Could not read .x mesh file '%ls'\n", fullMeshPath);
                 }
             } else {
-                PluginLog("DoImportConfig: Warning: Could not read mesh file '%ls'\n", fullMeshPath);
+                O3D_Model model;
+                if (ReadO3DFile(fullMeshPath, model)) {
+                    char nodeName[MAX_PATH];
+                    int count = ++nameCounts[rawName];
+                    if (count > 1) {
+                        snprintf(nodeName, sizeof(nodeName), "%s_%d", rawName, count - 1);
+                    } else {
+                        strncpy(nodeName, rawName, sizeof(nodeName) - 1);
+                        nodeName[sizeof(nodeName) - 1] = '\0';
+                    }
+
+                    if (ImportMeshToScene(scene, model, nodeName, meshDir, baseDir, preservePivot, matCache)) {
+                        importedCount++;
+                    }
+                } else {
+                    PluginLog("DoImportConfig: Warning: Could not read mesh file '%ls'\n", fullMeshPath);
+                }
             }
         }
     }
@@ -1320,6 +1822,58 @@ static unsigned int DoImport(P_e3_STREAM stream, P_e3_SCENE scene, void* options
     const wchar_t* pExt = wcsrchr(filePath, L'.');
     if (pExt && _wcsicmp(pExt, L".cfg") == 0) {
         return DoImportConfig(scene, filePath, preservePivot);
+    }
+
+    if (pExt && _wcsicmp(pExt, L".x") == 0) {
+        std::vector<X_NamedMesh> xMeshes;
+        if (!ReadXFile(filePath, xMeshes)) {
+            PluginLog("DoImport: ReadXFile failed for '%ls'\n", filePath);
+            return 0;
+        }
+
+        wchar_t modelDir[MAX_PATH] = {0};
+        wcscpy(modelDir, filePath);
+        wchar_t* pSep = wcsrchr(modelDir, L'\\');
+        if (!pSep) pSep = wcsrchr(modelDir, L'/');
+        if (pSep) *pSep = L'\0';
+
+        char rawName[MAX_PATH] = {0};
+        const wchar_t* pNameW = pSep ? (pSep + 1) : filePath;
+        WideCharToMultiByte(CP_ACP, 0, pNameW, -1, rawName, MAX_PATH, NULL, NULL);
+        char* pDot = strrchr(rawName, '.');
+        if (pDot) *pDot = '\0';
+
+        std::map<std::string, P_e3_MATERIAL> matCache;
+        std::map<std::string, int> nameCounts;
+        int importedCount = 0;
+
+        for (size_t mIdx = 0; mIdx < xMeshes.size(); mIdx++) {
+            char baseNodeName[MAX_PATH];
+            if (xMeshes.size() == 1) {
+                strncpy(baseNodeName, rawName, sizeof(baseNodeName) - 1);
+            } else {
+                if (!xMeshes[mIdx].name.empty()) {
+                    snprintf(baseNodeName, sizeof(baseNodeName), "%s_%s", rawName, xMeshes[mIdx].name.c_str());
+                } else {
+                    snprintf(baseNodeName, sizeof(baseNodeName), "%s_%u", rawName, (unsigned int)mIdx);
+                }
+            }
+            baseNodeName[sizeof(baseNodeName) - 1] = '\0';
+
+            char nodeName[MAX_PATH];
+            int count = ++nameCounts[baseNodeName];
+            if (count > 1) {
+                snprintf(nodeName, sizeof(nodeName), "%s_%d", baseNodeName, count - 1);
+            } else {
+                strncpy(nodeName, baseNodeName, sizeof(nodeName) - 1);
+                nodeName[sizeof(nodeName) - 1] = '\0';
+            }
+
+            if (ImportMeshToScene(scene, xMeshes[mIdx].model, nodeName, modelDir, NULL, preservePivot, matCache)) {
+                importedCount++;
+            }
+        }
+        return (importedCount > 0) ? 1 : 0;
     }
 
     // Single .o3d file import
