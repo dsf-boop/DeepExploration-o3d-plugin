@@ -35,7 +35,21 @@ static const char* GetLogFilePath() {
 // Log helper for debugging
 static void PluginLog(const char* fmt, ...) {
 #ifdef _DEBUG_LOG
-    FILE* f = fopen(GetLogFilePath(), "a");
+    const char* logPath = GetLogFilePath();
+    const char* openMode = "a";
+
+    // Auto-clear log when it reaches 10 MB limit
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(logPath, GetFileExInfoStandard, &fad)) {
+        LARGE_INTEGER size;
+        size.LowPart = fad.nFileSizeLow;
+        size.HighPart = fad.nFileSizeHigh;
+        if (size.QuadPart >= 10LL * 1024 * 1024) {
+            openMode = "w"; // Clear log file
+        }
+    }
+
+    FILE* f = fopen(logPath, openMode);
     if (!f) return;
     va_list args;
     va_start(args, fmt);
@@ -243,8 +257,8 @@ static bool ParseO3DData(const uint8_t* data, size_t fileSize, O3D_Model& model)
                 for (uint16_t i = 0; i < mat_count; i++) {
                     if (pos + 44 > fileSize) return false;
                     memcpy(model.materials[i].faceColor, data + pos, 16); pos += 16;
-                    memcpy(model.materials[i].specularColor, data + pos, 12); pos += 12;
                     memcpy(model.materials[i].emissiveColor, data + pos, 12); pos += 12;
+                    memcpy(model.materials[i].specularColor, data + pos, 12); pos += 12;
                     memcpy(&model.materials[i].power, data + pos, 4); pos += 4;
 
                     if (pos >= fileSize) return false;
@@ -426,8 +440,8 @@ static bool SerializeO3D(const O3D_Model& model, std::vector<uint8_t>& buf) {
 
     for (const auto& mat : model.materials) {
         buf.insert(buf.end(), (const uint8_t*)mat.faceColor, (const uint8_t*)mat.faceColor + 16);
-        buf.insert(buf.end(), (const uint8_t*)mat.specularColor, (const uint8_t*)mat.specularColor + 12);
         buf.insert(buf.end(), (const uint8_t*)mat.emissiveColor, (const uint8_t*)mat.emissiveColor + 12);
+        buf.insert(buf.end(), (const uint8_t*)mat.specularColor, (const uint8_t*)mat.specularColor + 12);
         buf.insert(buf.end(), (const uint8_t*)&mat.power, (const uint8_t*)&mat.power + 4);
         uint8_t tlen = (uint8_t)mat.texFileName.length();
         buf.push_back(tlen);
@@ -1425,7 +1439,7 @@ static bool ImportMeshToScene(P_e3_SCENE scene, const O3D_Model& model, const ch
                 // Emissive Color (0xd7, type 1: 3 floats)
                 Material_SetParam(mat, 0xd7, (unsigned int)o3dMat.emissiveColor, 1);
 
-                // Specular Power (0xe0, type 3: 1 float)
+                // Specular Power (0xe0: Power, type 3: 1 float)
                 Material_SetParam(mat, 0xe0, (unsigned int)&o3dMat.power, 3);
 
                 // Texture map (0x4008: string, 0x4001: flags)
@@ -1914,11 +1928,103 @@ static unsigned int DoImport(P_e3_STREAM stream, P_e3_SCENE scene, void* options
 // Plugin Export Implementation
 // -------------------------------------------------------------
 
+struct TextureTransform {
+    float m00, m01, m02;
+    float m10, m11, m12;
+    bool hasTransform;
+
+    TextureTransform() : m00(1.0f), m01(0.0f), m02(0.0f),
+                         m10(0.0f), m11(1.0f), m12(0.0f),
+                         hasTransform(false) {}
+};
+
 struct ExportContext {
     O3D_Model* model;
     P_e3_SCENE scene;
     std::map<P_e3_MATERIAL, uint16_t> matMap;
+    std::map<P_e3_MATERIAL, TextureTransform> matTransforms;
 };
+
+static void GetMaterialTextureTransform(P_e3_MATERIAL mat, TextureTransform& tt) {
+    tt = TextureTransform();
+    if (!mat) return;
+
+    // 1. Direct channel inspection from GCore.dll MATERIAL3D layout
+    void* chan = NULL;
+    if (!IsBadReadPtr(mat, 0x60)) {
+        void** pChannels = *(void***)((char*)mat + 0x58);
+        if (pChannels && !IsBadReadPtr(pChannels, sizeof(void*))) {
+            chan = pChannels[0]; // channel 0 = diffuse map
+        }
+    }
+
+    if (chan && !IsBadReadPtr(chan, 0x50)) {
+        float m00 = *(float*)((char*)chan + 0x26);
+        float m10 = *(float*)((char*)chan + 0x2a);
+        float m01 = *(float*)((char*)chan + 0x32);
+        float m11 = *(float*)((char*)chan + 0x36);
+        float m02 = *(float*)((char*)chan + 0x3e);
+        float m12 = *(float*)((char*)chan + 0x42);
+
+        if (fabs(m00) > 1e-6f || fabs(m11) > 1e-6f) {
+            if (fabs(m00 - 1.0f) > 1e-5f || fabs(m11 - 1.0f) > 1e-5f ||
+                fabs(m01) > 1e-5f || fabs(m10) > 1e-5f ||
+                fabs(m02) > 1e-5f || fabs(m12) > 1e-5f) {
+                tt.m00 = m00;
+                tt.m01 = m01;
+                tt.m02 = m02;
+                tt.m10 = m10;
+                tt.m11 = m11;
+                tt.m12 = m12;
+                tt.hasTransform = true;
+                return;
+            }
+        }
+    }
+
+    // 2. Safe fallback via Material_GetParam (vt[10])
+    float sU = 1.0f, sV = 1.0f, oU = 0.0f, oV = 0.0f, ang = 0.0f;
+    Material_GetParam(mat, 0x4002, (unsigned int)&sU, 3);
+    Material_GetParam(mat, 0x4003, (unsigned int)&sV, 3);
+    Material_GetParam(mat, 0x4004, (unsigned int)&oU, 3);
+    Material_GetParam(mat, 0x4005, (unsigned int)&oV, 3);
+    Material_GetParam(mat, 0x4006, (unsigned int)&ang, 3);
+    unsigned int flags = Material_GetParam(mat, 0x4001, 0, 1);
+
+    if (fabs(sU - 1.0f) > 1e-5f || fabs(sV - 1.0f) > 1e-5f ||
+        fabs(oU) > 1e-5f || fabs(oV) > 1e-5f || fabs(ang) > 1e-5f) {
+        tt.hasTransform = true;
+        float cosA = cosf(ang);
+        float sinA = sinf(ang);
+        if (flags & 4) { // rotate around center (0.5, 0.5)
+            tt.m00 = sU * cosA;
+            tt.m01 = -sU * sinA;
+            tt.m10 = sV * sinA;
+            tt.m11 = sV * cosA;
+            float u0 = oU - 0.5f;
+            float v0 = oV - 0.5f;
+            tt.m02 = sU * (u0 * cosA - v0 * sinA) + 0.5f;
+            tt.m12 = sV * (u0 * sinA + v0 * cosA) + 0.5f;
+        } else { // rotate around origin (0.0, 0.0)
+            tt.m00 = sU * cosA;
+            tt.m01 = -sU * sinA;
+            tt.m10 = sV * sinA;
+            tt.m11 = sV * cosA;
+            tt.m02 = sU * (oU * cosA - oV * sinA);
+            tt.m12 = sV * (oU * sinA + oV * cosA);
+        }
+    }
+}
+
+static inline void ApplyTextureTransform(const TextureTransform& tt, float inU, float inV, float& outU, float& outV) {
+    if (!tt.hasTransform) {
+        outU = inU;
+        outV = inV;
+        return;
+    }
+    outU = inU * tt.m00 + inV * tt.m01 + tt.m02;
+    outV = inU * tt.m10 + inV * tt.m11 + tt.m12;
+}
 
 static void ReadMaterialProperties(P_e3_MATERIAL mat, O3D_Material& outMat) {
     if (!mat || IsBadReadPtr(mat, sizeof(void*))) return;
@@ -1948,7 +2054,7 @@ static void ReadMaterialProperties(P_e3_MATERIAL mat, O3D_Material& outMat) {
         outMat.emissiveColor[2] = emis[2];
     }
     float pwr = 1.0f;
-    if (Material_GetParam(mat, 0xe0, (unsigned int)&pwr, 3)) {
+    if (Material_GetParam(mat, 0xe0, (unsigned int)&pwr, 3) && pwr > 0.0f) {
         outMat.power = pwr;
     }
     char texBuf[MAX_PATH] = {0};
@@ -1963,11 +2069,13 @@ struct VertexKey {
     int pos_idx;
     int norm_idx;
     int uv_idx;
+    P_e3_MATERIAL mat;
 
     bool operator<(const VertexKey& o) const {
         if (pos_idx != o.pos_idx) return pos_idx < o.pos_idx;
         if (uv_idx != o.uv_idx) return uv_idx < o.uv_idx;
-        return norm_idx < o.norm_idx;
+        if (norm_idx != o.norm_idx) return norm_idx < o.norm_idx;
+        return mat < o.mat;
     }
 };
 
@@ -2044,14 +2152,15 @@ static void ExportMeshNode(P_e3_NODE node, ExportContext* ctx) {
         }
     }
 
-    // Deduplicate vertices by unique (pos_idx, norm_idx, uv_idx) tuple
+    // Deduplicate vertices by unique (pos_idx, norm_idx, uv_idx, mat) tuple
     std::map<VertexKey, uint32_t> vertMap;
 
-    auto getOrCreateVertex = [&](int pos_idx, int norm_idx, int uv_idx) -> uint32_t {
+    auto getOrCreateVertex = [&](int pos_idx, int norm_idx, int uv_idx, P_e3_MATERIAL mat) -> uint32_t {
         VertexKey key;
         key.pos_idx = pos_idx;
         key.norm_idx = norm_idx;
         key.uv_idx = uv_idx;
+        key.mat = mat;
 
         auto it = vertMap.find(key);
         if (it != vertMap.end()) {
@@ -2095,8 +2204,18 @@ static void ExportMeshNode(P_e3_NODE node, ExportContext* ctx) {
 
         // UV
         if (pUVs && uv_idx >= 0 && uv_idx < numTPoints) {
-            v.uv.x = pUVs[uv_idx].u;
-            v.uv.y = 1.0f - pUVs[uv_idx].v; // Invert V back for DirectX / OMSI
+            DE_POINT2D inUV = pUVs[uv_idx];
+            DE_POINT2D outUV = inUV;
+
+            if (mat) {
+                auto itTT = ctx->matTransforms.find(mat);
+                if (itTT != ctx->matTransforms.end() && itTT->second.hasTransform) {
+                    ApplyTextureTransform(itTT->second, inUV.u, inUV.v, outUV.u, outUV.v);
+                }
+            }
+
+            v.uv.x = outUV.u;
+            v.uv.y = 1.0f - outUV.v; // Invert V back for DirectX / OMSI
         } else {
             v.uv.x = 0.0f;
             v.uv.y = 0.0f;
@@ -2127,18 +2246,6 @@ static void ExportMeshNode(P_e3_NODE node, ExportContext* ctx) {
         int n1 = pNFace ? pNFace[1] : (pNorms && fb < numNPoints ? fb : -1);
         int n2 = pNFace ? pNFace[2] : (pNorms && fc < numNPoints ? fc : -1);
 
-        // Face winding: swap 1 <-> 2 for OMSI coordinate reflection
-        // In DE: corner 0 = a, corner 1 = c, corner 2 = b
-        // In OMSI: face.a = corner 0, face.b = corner 2, face.c = corner 1
-        uint32_t idx_a = getOrCreateVertex(fa, n0, uv0);
-        uint32_t idx_b = getOrCreateVertex(fc, n2, uv2);
-        uint32_t idx_c = getOrCreateVertex(fb, n1, uv1);
-
-        O3D_Face face;
-        face.a = idx_a;
-        face.b = idx_b;
-        face.c = idx_c;
-
         P_e3_MATERIAL fMat = (pFaceMats && !IsBadReadPtr(pFaceMats + f, sizeof(P_e3_MATERIAL))) ? pFaceMats[f] : NULL;
         if (!fMat) fMat = defaultMat;
 
@@ -2151,18 +2258,37 @@ static void ExportMeshNode(P_e3_NODE node, ExportContext* ctx) {
                 matId = (uint16_t)ctx->model->materials.size();
                 O3D_Material outMat;
                 outMat.faceColor[0] = 0.8f; outMat.faceColor[1] = 0.8f; outMat.faceColor[2] = 0.8f; outMat.faceColor[3] = 1.0f;
-                outMat.specularColor[0] = 0.0f; outMat.specularColor[1] = 0.0f; outMat.specularColor[2] = 0.0f;
                 outMat.emissiveColor[0] = 0.0f; outMat.emissiveColor[1] = 0.0f; outMat.emissiveColor[2] = 0.0f;
+                outMat.specularColor[0] = 0.0f; outMat.specularColor[1] = 0.0f; outMat.specularColor[2] = 0.0f;
                 outMat.power = 1.0f;
                 ReadMaterialProperties(fMat, outMat);
                 ctx->model->materials.push_back(outMat);
                 ctx->matMap[fMat] = matId;
+
+                TextureTransform tt;
+                GetMaterialTextureTransform(fMat, tt);
+                ctx->matTransforms[fMat] = tt;
+                if (tt.hasTransform) {
+                    PluginLog("ExportMeshNode: Material %p has UV transform: m00=%.4f, m01=%.4f, m02=%.4f, m10=%.4f, m11=%.4f, m12=%.4f\n",
+                              fMat, tt.m00, tt.m01, tt.m02, tt.m10, tt.m11, tt.m12);
+                }
             }
         }
+
+        // Face winding: swap 1 <-> 2 for OMSI coordinate reflection
+        // In DE: corner 0 = a, corner 1 = c, corner 2 = b
+        // In OMSI: face.a = corner 0, face.b = corner 2, face.c = corner 1
+        uint32_t idx_a = getOrCreateVertex(fa, n0, uv0, fMat);
+        uint32_t idx_b = getOrCreateVertex(fc, n2, uv2, fMat);
+        uint32_t idx_c = getOrCreateVertex(fb, n1, uv1, fMat);
+
+        O3D_Face face;
+        face.a = idx_a;
+        face.b = idx_b;
+        face.c = idx_c;
         face.material_id = matId;
         ctx->model->faces.push_back(face);
     }
-
     PluginLog("ExportMeshNode: Exported mesh with %u unified vertices and %u faces\n",
               (unsigned int)vertMap.size(), numFaces);
 }
