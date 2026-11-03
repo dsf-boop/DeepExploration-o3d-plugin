@@ -1363,8 +1363,74 @@ static inline unsigned int Material_GetParam(P_e3_MATERIAL mat, int paramId, uns
 
 // Map to preserve original transformation matrices (animation pivots)
 static std::map<void*, std::vector<float>> s_originalMatrix;
+// Map to preserve original texture file names for materials (to prevent loss of Cyrillic/encoding on export)
+static std::map<void*, std::string> s_originalTexName;
 static std::vector<float> s_lastImportedMatrix;
 static bool s_hasLastImportedMatrix = false;
+
+static std::vector<std::wstring> GetCandidateWideStrings(const std::string& str) {
+    std::vector<std::wstring> candidates;
+    if (str.empty()) return candidates;
+
+    std::string cleanStr = str;
+    while (!cleanStr.empty() && ((unsigned char)cleanStr.back() == '\0' || cleanStr.back() == ' ' || 
+           cleanStr.back() == '\r' || cleanStr.back() == '\n' || cleanStr.back() == '\t' ||
+           cleanStr.back() == '"' || cleanStr.back() == (char)39)) {
+        cleanStr.pop_back();
+    }
+    size_t start = 0;
+    while (start < cleanStr.size() && (cleanStr[start] == ' ' || cleanStr[start] == '\t' || 
+           cleanStr[start] == '"' || cleanStr[start] == (char)39)) {
+        start++;
+    }
+    if (start > 0) cleanStr.erase(0, start);
+    if (cleanStr.empty()) return candidates;
+
+    auto tryAddCodePage = [&](UINT cp, DWORD flags) {
+        int wlen = MultiByteToWideChar(cp, flags, cleanStr.c_str(), (int)cleanStr.length(), NULL, 0);
+        if (wlen > 0) {
+            std::vector<wchar_t> wbuf(wlen + 1, 0);
+            if (MultiByteToWideChar(cp, flags, cleanStr.c_str(), (int)cleanStr.length(), wbuf.data(), wlen) > 0) {
+                std::wstring ws(wbuf.data());
+                for (auto& ch : ws) {
+                    if (ch == L'/') ch = L'\\';
+                }
+                if (std::find(candidates.begin(), candidates.end(), ws) == candidates.end()) {
+                    candidates.push_back(ws);
+                }
+            }
+        }
+    };
+
+    // 1. Try system ANSI codepage
+    tryAddCodePage(CP_ACP, 0);
+
+    // 2. Try Windows-1251 (Cyrillic: Ukrainian, Bulgarian, etc.)
+    tryAddCodePage(1251, 0);
+
+    // 3. Try Windows-1252 (Western European: German, French, Spanish)
+    tryAddCodePage(1252, 0);
+
+    // 4. Try Windows-1250 (Central European: Polish, Czech, Slovak, Hungarian)
+    tryAddCodePage(1250, 0);
+
+    // 5. Try UTF-8 (Universal: Chinese, Japanese, Arabic, Umlauts, Cyrillic, etc.)
+    tryAddCodePage(CP_UTF8, MB_ERR_INVALID_CHARS);
+
+    // 6. Try CP936 (Simplified Chinese GBK)
+    tryAddCodePage(936, 0);
+
+    // 7. Try CP932 (Japanese Shift-JIS)
+    tryAddCodePage(932, 0);
+
+    // 8. Try Windows-1256 (Arabic)
+    tryAddCodePage(1256, 0);
+
+    // 9. Try CP866 (OEM Cyrillic)
+    tryAddCodePage(866, 0);
+
+    return candidates;
+}
 
 static bool ImportMeshToScene(P_e3_SCENE scene, const O3D_Model& model, const char* nodeName,
                              const wchar_t* modelDir, const wchar_t* baseDir, bool preservePivot,
@@ -1404,7 +1470,14 @@ static bool ImportMeshToScene(P_e3_SCENE scene, const O3D_Model& model, const ch
         for (size_t m = 0; m < model.materials.size(); m++) {
             const auto& o3dMat = model.materials[m];
             char mName[MAX_PATH];
-            if (!o3dMat.texFileName.empty()) {
+            std::vector<std::wstring> cands = GetCandidateWideStrings(o3dMat.texFileName);
+            if (!cands.empty()) {
+                const wchar_t* pSlashW = wcsrchr(cands[0].c_str(), L'\\');
+                if (!pSlashW) pSlashW = wcsrchr(cands[0].c_str(), L'/');
+                const wchar_t* baseW = pSlashW ? (pSlashW + 1) : cands[0].c_str();
+                WideCharToMultiByte(CP_ACP, 0, baseW, -1, mName, sizeof(mName), NULL, NULL);
+                mName[sizeof(mName) - 1] = '\0';
+            } else if (!o3dMat.texFileName.empty()) {
                 const char* pSlashM = strrchr(o3dMat.texFileName.c_str(), '\\');
                 if (!pSlashM) pSlashM = strrchr(o3dMat.texFileName.c_str(), '/');
                 const char* base = pSlashM ? (pSlashM + 1) : o3dMat.texFileName.c_str();
@@ -1424,6 +1497,9 @@ static bool ImportMeshToScene(P_e3_SCENE scene, const O3D_Model& model, const ch
 
             P_e3_MATERIAL mat = Scene_CreateMaterial(scene);
             if (mat) {
+                if (!o3dMat.texFileName.empty()) {
+                    s_originalTexName[mat] = o3dMat.texFileName;
+                }
                 Material_SetNameA(mat, mName);
 
                 // Diffuse Color (0xc9, type 1: 3 floats)
@@ -1445,44 +1521,150 @@ static bool ImportMeshToScene(P_e3_SCENE scene, const O3D_Model& model, const ch
                 // Texture map (0x4008: string, 0x4001: flags)
                 if (!o3dMat.texFileName.empty()) {
                     std::string finalTexPath = o3dMat.texFileName;
-                    wchar_t candidate[MAX_PATH];
                     bool found = false;
 
                     const wchar_t* dirsToCheck[] = { modelDir, baseDir };
-                    for (const wchar_t* d : dirsToCheck) {
-                        if (!d || d[0] == L'\0') continue;
 
-                        // 1. Check same directory
-                        swprintf(candidate, MAX_PATH, L"%ls\\%hs", d, o3dMat.texFileName.c_str());
-                        if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) {
-                            char cBuf[MAX_PATH];
-                            WideCharToMultiByte(CP_ACP, 0, candidate, -1, cBuf, MAX_PATH, NULL, NULL);
-                            finalTexPath = cBuf;
+                    auto tryFindTexture = [&](const std::wstring& wsCandidate, std::string& outFinalPath) -> bool {
+                        if (wsCandidate.empty()) return false;
+
+                        const wchar_t* pWsSlash = wcsrchr(wsCandidate.c_str(), L'\\');
+                        const wchar_t* wsBase = pWsSlash ? (pWsSlash + 1) : wsCandidate.c_str();
+
+                        for (const wchar_t* d : dirsToCheck) {
+                            if (!d || d[0] == L'\0') continue;
+
+                            const wchar_t* subDirsCandidate[] = {
+                                L"%ls\\%ls",
+                                L"%ls\\Texture\\%ls",
+                                L"%ls\\texture\\%ls",
+                                L"%ls\\..\\Texture\\%ls",
+                                L"%ls\\..\\texture\\%ls",
+                                L"%ls\\..\\..\\Texture\\%ls",
+                                L"%ls\\..\\..\\texture\\%ls",
+                                L"%ls\\..\\..\\..\\Texture\\%ls",
+                                L"%ls\\..\\..\\..\\texture\\%ls"
+                            };
+
+                            for (const auto* fmt : subDirsCandidate) {
+                                wchar_t candidate[MAX_PATH];
+                                swprintf(candidate, MAX_PATH, fmt, d, wsCandidate.c_str());
+                                if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) {
+                                    wchar_t fullCandidate[MAX_PATH] = {0};
+                                    if (GetFullPathNameW(candidate, MAX_PATH, fullCandidate, NULL) == 0) {
+                                        wcscpy(fullCandidate, candidate);
+                                    }
+                                    BOOL usedDefault = FALSE;
+                                    char cBuf[MAX_PATH] = {0};
+                                    WideCharToMultiByte(CP_ACP, 0, fullCandidate, -1, cBuf, MAX_PATH, "?", &usedDefault);
+                                    if (!usedDefault) {
+                                        outFinalPath = cBuf;
+                                    } else {
+                                        wchar_t shortCandidate[MAX_PATH] = {0};
+                                        if (GetShortPathNameW(fullCandidate, shortCandidate, MAX_PATH) > 0) {
+                                            WideCharToMultiByte(CP_ACP, 0, shortCandidate, -1, cBuf, MAX_PATH, NULL, NULL);
+                                            outFinalPath = cBuf;
+                                        } else {
+                                            outFinalPath = cBuf;
+                                        }
+                                    }
+                                    return true;
+                                }
+                            }
+
+                            if (wsBase != wsCandidate.c_str()) {
+                                const wchar_t* subDirsBase[] = {
+                                    L"%ls\\Texture\\%ls",
+                                    L"%ls\\texture\\%ls",
+                                    L"%ls\\..\\Texture\\%ls",
+                                    L"%ls\\..\\texture\\%ls",
+                                    L"%ls\\..\\..\\Texture\\%ls",
+                                    L"%ls\\..\\..\\texture\\%ls",
+                                    L"%ls\\..\\..\\..\\Texture\\%ls",
+                                    L"%ls\\..\\..\\..\\texture\\%ls"
+                                };
+                                for (const auto* fmt : subDirsBase) {
+                                    wchar_t candidate[MAX_PATH];
+                                    swprintf(candidate, MAX_PATH, fmt, d, wsBase);
+                                    if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) {
+                                        wchar_t fullCandidate[MAX_PATH] = {0};
+                                        if (GetFullPathNameW(candidate, MAX_PATH, fullCandidate, NULL) == 0) {
+                                            wcscpy(fullCandidate, candidate);
+                                        }
+                                        BOOL usedDefault = FALSE;
+                                        char cBuf[MAX_PATH] = {0};
+                                        WideCharToMultiByte(CP_ACP, 0, fullCandidate, -1, cBuf, MAX_PATH, "?", &usedDefault);
+                                        if (!usedDefault) {
+                                            outFinalPath = cBuf;
+                                        } else {
+                                            wchar_t shortCandidate[MAX_PATH] = {0};
+                                            if (GetShortPathNameW(fullCandidate, shortCandidate, MAX_PATH) > 0) {
+                                                WideCharToMultiByte(CP_ACP, 0, shortCandidate, -1, cBuf, MAX_PATH, NULL, NULL);
+                                                outFinalPath = cBuf;
+                                            } else {
+                                                outFinalPath = cBuf;
+                                            }
+                                        }
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                        return false;
+                    };
+
+                    // 1. Pass 1: Try exact filename and extension
+                    for (const auto& wsCandidate : cands) {
+                        if (tryFindTexture(wsCandidate, finalTexPath)) {
                             found = true;
                             break;
                         }
-
-                        // 2. Check Texture/ or ../Texture or ../../Texture
-                        const wchar_t* subDirs[] = {
-                            L"%ls\\Texture\\%hs",
-                            L"%ls\\..\\Texture\\%hs",
-                            L"%ls\\..\\..\\Texture\\%hs",
-                            L"%ls\\texture\\%hs",
-                            L"%ls\\..\\texture\\%hs",
-                            L"%ls\\..\\..\\texture\\%hs"
-                        };
-                        for (const auto* fmt : subDirs) {
-                            swprintf(candidate, MAX_PATH, fmt, d, o3dMat.texFileName.c_str());
-                            if (GetFileAttributesW(candidate) != INVALID_FILE_ATTRIBUTES) {
-                                char cBuf[MAX_PATH];
-                                WideCharToMultiByte(CP_ACP, 0, candidate, -1, cBuf, MAX_PATH, NULL, NULL);
-                                finalTexPath = cBuf;
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (found) break;
                     }
+
+                    // 2. Pass 2: Fallback to common OMSI texture extensions if exact file not found
+                    if (!found) {
+                        static const wchar_t* fallbackExts[] = {
+                            L".dds", L".tga", L".bmp", L".png", L".jpg", L".jpeg"
+                        };
+
+                        for (const auto& wsCandidate : cands) {
+                            if (wsCandidate.empty()) continue;
+
+                            const wchar_t* pDot = wcsrchr(wsCandidate.c_str(), L'.');
+                            const wchar_t* pSlash = wcsrchr(wsCandidate.c_str(), L'\\');
+                            if (pDot && pSlash && pDot < pSlash) pDot = NULL;
+
+                            std::wstring stem = pDot ? wsCandidate.substr(0, pDot - wsCandidate.c_str()) : wsCandidate;
+                            const wchar_t* origExt = pDot ? pDot : L"";
+
+                            for (const wchar_t* ext : fallbackExts) {
+                                if (origExt[0] != L'\0' && _wcsicmp(origExt, ext) == 0) {
+                                    continue;
+                                }
+
+                                std::wstring altCandidate = stem + ext;
+                                if (tryFindTexture(altCandidate, finalTexPath)) {
+                                    found = true;
+                                    PluginLog("ImportMeshToScene: Exact texture '%ls' not found, using fallback '%ls' (path: '%s')\n",
+                                              wsCandidate.c_str(), altCandidate.c_str(), finalTexPath.c_str());
+                                    break;
+                                }
+                            }
+                            if (found) break;
+                        }
+                    }
+
+                    if (!found && !cands.empty()) {
+                        char cBuf[MAX_PATH] = {0};
+                        BOOL usedDefault = FALSE;
+                        WideCharToMultiByte(CP_ACP, 0, cands[0].c_str(), -1, cBuf, MAX_PATH, "?", &usedDefault);
+                        if (!usedDefault) {
+                            finalTexPath = cBuf;
+                        }
+                    }
+
+                    PluginLog("ImportMeshToScene: Material '%s', tex='%s' -> finalTex='%s' (found=%d)\n",
+                              mName, o3dMat.texFileName.c_str(), finalTexPath.c_str(), found ? 1 : 0);
 
                     Material_SetParam(mat, 0x4008, (unsigned int)finalTexPath.c_str(), 0xc);
                     unsigned int flags = Material_GetParam(mat, 0x4001, 0, 1);
@@ -1647,6 +1829,9 @@ static bool ImportMeshToScene(P_e3_SCENE scene, const O3D_Model& model, const ch
 static unsigned int DoImportConfig(P_e3_SCENE scene, const wchar_t* cfgPath, bool preservePivot) {
     PluginLog("DoImportConfig: Parsing OMSI model config '%ls'\n", cfgPath);
 
+    s_originalMatrix.clear();
+    s_originalTexName.clear();
+
     FILE* f = _wfopen(cfgPath, L"r");
     if (!f) {
         PluginLog("DoImportConfig: Failed to open '%ls'\n", cfgPath);
@@ -1728,6 +1913,24 @@ static unsigned int DoImportConfig(P_e3_SCENE scene, const wchar_t* cfgPath, boo
 
             wchar_t fullMeshPath[MAX_PATH];
             swprintf(fullMeshPath, MAX_PATH, L"%ls\\%ls", baseDir, relPathW);
+            if (GetFileAttributesW(fullMeshPath) == INVALID_FILE_ATTRIBUTES) {
+                UINT fallbacks[] = { 1251, 1252, 1250, CP_UTF8 };
+                for (UINT cp : fallbacks) {
+                    wchar_t altRel[MAX_PATH];
+                    if (MultiByteToWideChar(cp, 0, meshRelPath, -1, altRel, MAX_PATH)) {
+                        for (int i = 0; altRel[i]; i++) {
+                            if (altRel[i] == L'/') altRel[i] = L'\\';
+                        }
+                        wchar_t altFull[MAX_PATH];
+                        swprintf(altFull, MAX_PATH, L"%ls\\%ls", baseDir, altRel);
+                        if (GetFileAttributesW(altFull) != INVALID_FILE_ATTRIBUTES) {
+                            wcscpy(fullMeshPath, altFull);
+                            wcscpy(relPathW, altRel);
+                            break;
+                        }
+                    }
+                }
+            }
 
             wchar_t meshDir[MAX_PATH];
             wcscpy(meshDir, fullMeshPath);
@@ -1817,6 +2020,9 @@ static unsigned int DoImport(P_e3_STREAM stream, P_e3_SCENE scene, void* options
         PluginLog("DoImport: Empty filePath, cannot proceed\n");
         return 0;
     }
+
+    s_originalMatrix.clear();
+    s_originalTexName.clear();
 
     bool preservePivot = true;
     if (options && !IsBadReadPtr(options, sizeof(void*))) {
@@ -2061,7 +2267,58 @@ static void ReadMaterialProperties(P_e3_MATERIAL mat, O3D_Material& outMat) {
     if (Material_GetParam(mat, 0x4008, (unsigned int)texBuf, 0xc) && texBuf[0]) {
         const char* pSlash = strrchr(texBuf, '\\');
         if (!pSlash) pSlash = strrchr(texBuf, '/');
-        outMat.texFileName = pSlash ? (pSlash + 1) : texBuf;
+        const char* baseTex = pSlash ? (pSlash + 1) : texBuf;
+
+        auto it = s_originalTexName.find(mat);
+        if (it != s_originalTexName.end() && !it->second.empty()) {
+            const char* pOrigSlash = strrchr(it->second.c_str(), '\\');
+            if (!pOrigSlash) pOrigSlash = strrchr(it->second.c_str(), '/');
+            const char* origBase = pOrigSlash ? (pOrigSlash + 1) : it->second.c_str();
+
+            if (_stricmp(baseTex, origBase) == 0) {
+                outMat.texFileName = it->second;
+            } else {
+                // Check if baseTex has same stem as origBase (fallback extension like .png -> .dds)
+                const char* pBaseDot = strrchr(baseTex, '.');
+                const char* pOrigDot = strrchr(origBase, '.');
+                std::string baseStem = pBaseDot ? std::string(baseTex, pBaseDot - baseTex) : baseTex;
+                std::string origStem = pOrigDot ? std::string(origBase, pOrigDot - origBase) : origBase;
+
+                if (_stricmp(baseStem.c_str(), origStem.c_str()) == 0) {
+                    // Same stem with fallback extension: preserve original path and stem encoding, update extension
+                    const char* pOrigPathDot = strrchr(it->second.c_str(), '.');
+                    std::string origPathStem = pOrigPathDot ? std::string(it->second.c_str(), pOrigPathDot - it->second.c_str()) : it->second;
+                    outMat.texFileName = pBaseDot ? (origPathStem + pBaseDot) : origPathStem;
+                } else {
+                    wchar_t wOrig[MAX_PATH] = {0};
+                    MultiByteToWideChar(CP_ACP, 0, origBase, -1, wOrig, MAX_PATH);
+                    wchar_t wShort[MAX_PATH] = {0};
+                    if (GetShortPathNameW(wOrig, wShort, MAX_PATH) > 0) {
+                        char cShort[MAX_PATH] = {0};
+                        WideCharToMultiByte(CP_ACP, 0, wShort, -1, cShort, MAX_PATH, NULL, NULL);
+                        const char* pShortBase = strrchr(cShort, '\\');
+                        pShortBase = pShortBase ? (pShortBase + 1) : cShort;
+
+                        const char* pShortDot = strrchr(pShortBase, '.');
+                        std::string shortStem = pShortDot ? std::string(pShortBase, pShortDot - pShortBase) : pShortBase;
+
+                        if (_stricmp(baseTex, pShortBase) == 0) {
+                            outMat.texFileName = it->second;
+                        } else if (_stricmp(baseStem.c_str(), shortStem.c_str()) == 0) {
+                            const char* pOrigPathDot = strrchr(it->second.c_str(), '.');
+                            std::string origPathStem = pOrigPathDot ? std::string(it->second.c_str(), pOrigPathDot - it->second.c_str()) : it->second;
+                            outMat.texFileName = pBaseDot ? (origPathStem + pBaseDot) : origPathStem;
+                        } else {
+                            outMat.texFileName = baseTex;
+                        }
+                    } else {
+                        outMat.texFileName = baseTex;
+                    }
+                }
+            }
+        } else {
+            outMat.texFileName = baseTex;
+        }
     }
 }
 
